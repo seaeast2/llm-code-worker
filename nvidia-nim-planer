@@ -1,0 +1,17 @@
+#!/usr/bin/env sh
+
+script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+planer_script="$script_dir/nvidia_nim_planer.py"
+
+if [ -n "${VIRTUAL_ENV:-}" ] && [ -x "$VIRTUAL_ENV/bin/python" ]; then
+    python_bin="$VIRTUAL_ENV/bin/python"
+elif [ -x "$script_dir/.venv/bin/python" ]; then
+    python_bin="$script_dir/.venv/bin/python"
+elif command -v python3 >/dev/null 2>&1; then
+    python_bin="$(command -v python3)"
+else
+    printf "%s\n" "nvidia-nim-planer: no usable Python interpreter found" >&2
+    exit 1
+fi
+
+exec "$python_bin" "$planer_script" "$@"
