@@ -7,7 +7,7 @@ from pathlib import Path
 
 import nvidia_nim_worker
 
-DEFAULT_PLANNER_MODEL = "deepseek-ai/deepseek-v4-flash"
+DEFAULT_PLANNER_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 DEFAULT_MAX_ITERATIONS = 6
 
 PLANNER_SYSTEM_PROMPT = """You are a planning and validation agent for autonomous coding.
