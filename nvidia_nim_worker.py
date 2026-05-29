@@ -4,13 +4,15 @@ import re
 import subprocess
 import sys
 import time
+import json
 from pathlib import Path
 
 DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1"
 DEFAULT_BASE_URL_ENV = "OPENAI_API_BASE"
 DEFAULT_API_KEY_ENV = "OPENAI_API_KEY"
 DEFAULT_ALLOW_MISSING_API_KEY = False
-DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
+#DEFAULT_MODEL = "deepseek-ai/deepseek-v4-flash"
+DEFAULT_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 NEMOTRON_NANO_MODEL = "nvidia/nemotron-3-nano-30b-a3b"
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TEMPERATURE = 1.0
@@ -141,6 +143,82 @@ def build_client(args):
             api_key = "local"
         else:
             raise RuntimeError(missing_key_message())
+
+    # If running in local mode, provide a minimal dummy client that can handle
+    # simple file operations (create/delete) by returning file-blocks so the
+    # planner can apply them. This avoids crashing when the openai package is
+    # not installed and --allow-missing-api-key was requested.
+    if api_key == "local":
+        from types import SimpleNamespace
+
+        def _is_delete_instruction_local(text: str) -> bool:
+            if not text:
+                return False
+            t = text.lower()
+            for k in ("delete", "remove", "rm", "삭제", "지워", "제거", "삭제해"):
+                if k in t:
+                    return True
+            return False
+
+        def _generate_patch_from_task(task_text: str) -> str:
+            task_text = task_text or ""
+            toks = re.findall(r"([^\s,()\"'<>]+?\.[A-Za-z0-9]+)", task_text)
+            if _is_delete_instruction_local(task_text) and toks:
+                path = toks[0]
+                return f"===FILE: {path} ACTION: delete===\n```text\n\n```"
+            # For create/write tasks, provide minimal placeholder contents
+            if any(k in task_text.lower() for k in ("create", "write", "add", "make")) and toks:
+                blocks: list[str] = []
+                for t in toks:
+                    ext = os.path.splitext(t)[1].lower()
+                    if ext in {".c", ".cpp", ".cc", ".h", ".hpp"}:
+                        content = "// created by local stub\n"
+                    elif ext == ".py":
+                        content = "# created by local stub\n"
+                    else:
+                        content = "// created by local stub\n"
+                    blocks.append(f"===FILE: {t} ACTION: create===\n```text\n{content}```")
+                return "\n".join(blocks)
+            return "NEEDS_CLARIFICATION: Local stub cannot perform this task without an LLM."
+
+        class DummyCompletions:
+            @staticmethod
+            def create(*args, **kwargs):
+                messages = kwargs.get("messages") if kwargs.get("messages") is not None else (args[1] if len(args) > 1 else None)
+                # collect user-facing text
+                user_text = ""
+                combined = ""
+                if isinstance(messages, list):
+                    combined = "\n".join(m.get("content", "") for m in messages if isinstance(m, dict))
+                    for m in messages:
+                        if m.get("role") == "user":
+                            user_text = m.get("content", "") or user_text
+                # Determine if this is a planner call (planner system prompt present)
+                is_planner = False
+                if isinstance(messages, list) and messages:
+                    first = messages[0].get("content", "") if isinstance(messages[0], dict) else ""
+                    if "You are a planning agent for an autonomous 3-stage coding loop" in first or "Return strictly valid JSON only" in first:
+                        is_planner = True
+                if is_planner:
+                    # return JSON planner decision
+                    toks = re.findall(r"([^\s,()\"'<>]+?\.[A-Za-z0-9]+)", user_text)
+                    if _is_delete_instruction_local(user_text) and toks:
+                        parsed = {"action": "run_worker", "worker_task": f"Delete the file or directory named '{toks[0]}'"}
+                    else:
+                        parsed = {"action": "done", "done_reason": "Local stub: nothing to do or unsupported task"}
+                    return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(parsed, ensure_ascii=False)))])
+
+                # Otherwise treat as worker call: produce a patch or file-block
+                content = _generate_patch_from_task(user_text or combined)
+                return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content))])
+
+        class DummyChat:
+            completions = DummyCompletions
+
+        class DummyClient:
+            chat = DummyChat
+
+        return DummyClient()
 
     try:
         from openai import OpenAI
@@ -350,10 +428,10 @@ def build_messages(task: str, context: str, context_manifest: list[str]) -> list
         [
             "",
             "Output requirements:",
-            "- Return a unified diff patch only.",
-            "- Include full git-style file headers: diff --git, --- and +++.",
-            "- Include complete @@ hunk headers; do not return a bare hunk.",
-            "- For new files, use one hunk that contains all added lines.",
+            "- Prefer a unified git diff patch. If returning a unified diff is difficult, you MAY instead return explicit machine-parsable file blocks using the exact format below.",
+            "- If returning a unified diff: include full git-style file headers: diff --git, --- a/..., +++ b/..., and complete @@ hunk headers; do not return a bare hunk.",
+            "- If returning file blocks: for each file output exactly:\n===FILE: <path> ACTION: <create|modify|delete>===\n```text\n<file contents>\n```\nand do not add any other text outside these blocks.",
+            "- For new files, include all added lines (a single hunk is fine).",
             "- Make the smallest change that satisfies the task.",
             "- Preserve formatting and existing behavior unless the task requires a change.",
         ]
@@ -399,25 +477,27 @@ def completion_kwargs(args, messages: list[dict[str, str]], stream: bool) -> dic
     return kwargs
 
 
-def emit_completion(completion) -> None:
+def emit_completion(completion, output_path: str | None = None) -> str:
     output_parts: list[str] = []
     choices = getattr(completion, "choices", None)
     if choices is not None:
         content = choices[0].message.content if choices else ""
         if content:
             output_parts.append(content)
-            print(clean_patch_output("".join(output_parts)), end="")
-        return
+    else:
+        for chunk in completion:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta.content:
+                output_parts.append(delta.content)
 
-    for chunk in completion:
-        if not chunk.choices:
-            continue
-        delta = chunk.choices[0].delta
-        if delta.content:
-            output_parts.append(delta.content)
-
-    print(clean_patch_output("".join(output_parts)), end="")
+    patch = clean_patch_output("".join(output_parts))
+    if output_path:
+        Path(output_path).expanduser().write_text(patch, encoding="utf-8")
+    print(patch, end="")
     sys.stdout.flush()
+    return patch
 
 
 def clean_patch_output(output: str) -> str:
@@ -443,21 +523,64 @@ def clean_patch_output(output: str) -> str:
         if line.strip() not in {"+\\ No newline at end of file", "\\ No newline at end of file"}
     ]
     normalized_lines: list[str] = []
+    i = 0
     in_file_diff = False
     has_new_file_mode = False
-    for line in lines:
+    hunk_header_re = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+    while i < len(lines):
+        line = lines[i]
         if line.startswith("diff --git "):
             in_file_diff = True
             has_new_file_mode = False
             normalized_lines.append(line)
+            i += 1
             continue
         if in_file_diff and line.startswith("new file mode "):
             has_new_file_mode = True
+            normalized_lines.append(line)
+            i += 1
+            continue
         if in_file_diff and line == "--- /dev/null" and not has_new_file_mode:
             normalized_lines.append("new file mode 100644")
             has_new_file_mode = True
+            normalized_lines.append(line)
+            i += 1
+            continue
+        if line.startswith("@@ "):
+            match = hunk_header_re.match(line)
+            if match:
+                old_start = int(match.group(1))
+                new_start = int(match.group(3))
+                hunk_lines: list[str] = []
+                i += 1
+                while i < len(lines):
+                    next_line = lines[i]
+                    if next_line.startswith("diff --git ") or next_line.startswith("@@ "):
+                        break
+                    hunk_lines.append(next_line)
+                    i += 1
+
+                old_count = 0
+                new_count = 0
+                for hunk_line in hunk_lines:
+                    if hunk_line.startswith("+") and not hunk_line.startswith("+++"):
+                        new_count += 1
+                    elif hunk_line.startswith("-") and not hunk_line.startswith("---"):
+                        old_count += 1
+                    elif hunk_line.startswith(" "):
+                        old_count += 1
+                        new_count += 1
+
+                normalized_lines.append(f"@@ -{old_start},{old_count} +{new_start},{new_count} @@")
+                normalized_lines.extend(hunk_lines)
+                continue
+
         normalized_lines.append(line)
-    return "\n".join(normalized_lines)
+        i += 1
+
+    result = "\n".join(normalized_lines)
+    return result + ("\n" if result else "")
 
 
 def request_completion(client, args, messages: list[dict[str, str]]):
@@ -509,9 +632,9 @@ def main() -> int:
   6. Codex reviews the patch before applying it.
 
 Examples:
-  nvidia-nim-worker --task "Add a parser option for dry-run."
-  nvidia-nim-worker --task "Refactor the parser." --context src/app.py --context src/util.py
-  nvidia-nim-worker --no-auto-context --task "Patch README.md" --context README.md
+  python3 nvidia_nim_worker.py --task "Add a parser option for dry-run."
+  python3 nvidia_nim_worker.py --task "Refactor the parser." --context src/app.py --context src/util.py
+  python3 nvidia_nim_worker.py --no-auto-context --task "Patch README.md" --context README.md
 
 Environment:
   OPENAI_API_KEY is required. OPENAI_API_BASE is optional and defaults to NVIDIA NIM.
@@ -601,6 +724,10 @@ Environment:
         choices=("low", "medium", "high"),
         help=f"Reasoning effort for supported NVIDIA endpoints (default: {DEFAULT_REASONING_EFFORT}).",
     )
+    parser.add_argument(
+        "--output",
+        help="Optional file path to write the final cleaned patch while still printing it to stdout.",
+    )
     args = parser.parse_args()
 
     task = read_task(args.task)
@@ -617,7 +744,7 @@ Environment:
 
     client = build_client(args)
     completion = request_completion(client, args, messages)
-    emit_completion(completion)
+    emit_completion(completion, args.output)
 
     return 0
 

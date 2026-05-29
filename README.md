@@ -1,7 +1,7 @@
 # NVIDIA NIM Code Worker
 
 `nvidia_nim_worker.py` sends a coding task to NVIDIA NIM and prints a unified diff patch.
-Codex can handle planning and validation; this script is the code-generation worker. It auto-collects repo context by default so Codex can pass shorter tasks.
+Codex can handle planning and validation; this script is the code-generation worker. It auto-collects repo context by default so Codex can pass shorter tasks. Pass `--output patch.diff` if you also want the cleaned patch written to a file.
 
 ## Setup
 
@@ -41,10 +41,11 @@ python nvidia_nim_worker.py --task "Add a new file named NOTES.txt containing ex
 
 ## Global command
 
-If `~/.local/bin` is on your `PATH`, you can run the worker from any folder:
+If you put both `nvidia-nim-worker` and `nvidia_nim_worker.py` in a directory on your `PATH`, you can run the worker from any folder. The launcher uses the active `VIRTUAL_ENV` Python first, then `.venv` next to the script, and finally `python3` as a fallback:
 
 ```bash
 nvidia-nim-worker --task "Add a new file named NOTES.txt containing exactly one line: Hello from NIM."
+nvidia-nim-worker --task "Add a new file named NOTES.txt containing exactly one line: Hello from NIM." --output patch.diff
 ```
 
 If the command is not found, add this to your shell profile and open a new terminal:
@@ -53,7 +54,26 @@ If the command is not found, add this to your shell profile and open a new termi
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-On Windows, `local-llm-worker.cmd` can be placed on `PATH` in the same way as `nvidia-nim-worker.cmd`.
+On Windows, a `nvidia-nim-worker.cmd` wrapper can be placed alongside `nvidia_nim_worker.py` on `PATH` in the same way.
+
+## Planner
+
+`nvidia_nim_planer.py` runs the worker in a loop, updates `PLAN.md` after each step, and prints the planner's raw LLM response and parsed decision to stderr so you can see what it is doing.
+
+`PLAN.md` is the planner's coordination file. It records:
+
+- the current goal
+- the current iteration and phase
+- the latest repo status
+- the recent progress log
+
+Run it like this:
+
+```bash
+python3 nvidia_nim_planer.py --task "hello world 를 출력하는 C 언어 프로그램을 만들어줘."
+```
+
+If you want the loop to stop sooner or run longer, use `--max-iterations`.
 
 ## Local LLM worker
 
@@ -79,4 +99,5 @@ The worker auto-collects repository docs, changed files, and task-matched files 
 ```bash
 python3 nvidia_nim_worker.py --task "Refactor the parser" --context path/to/file.py --context path/to/another.py
 python3 nvidia_nim_worker.py --no-auto-context --task "Refactor the parser" --context path/to/file.py
+python3 nvidia_nim_worker.py --task "Refactor the parser" --output patch.diff
 ```
